@@ -3,202 +3,214 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import requests
+import json
+from bs4 import BeautifulSoup
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 
 # ==========================================
-# 1. SYSTEM SETUP & MODEL HANDLING
+# CONFIGURATION
+# ==========================================
+st.set_page_config(page_title="2-Up Master Suite", layout="centered")
+
+# Defines which year to scrape for the Scout (Update this in August each year)
+# Since today is Dec 2025, we are in the 2025/2026 season.
+CURRENT_SEASON_YEAR = 2025 
+
+LEAGUES = ['EPL', 'La_liga', 'Bundesliga', 'Serie_A', 'Ligue_1']
+
+# ==========================================
+# 1. LIVE PREDICTOR LOGIC
 # ==========================================
 
-MODEL_FILE = 'final_2up_model.pkl'
-SCALER_FILE = 'final_2up_scaler.pkl'
+def load_system(league_name):
+    """Loads the specific brain for the selected league."""
+    model_file = f"model_{league_name}.pkl"
+    scaler_file = f"scaler_{league_name}.pkl"
 
-def ensure_model_exists():
-    """
-    Checks if the ML model exists. If not, trains a lightweight 
-    placeholder model so the App doesn't crash on first run.
-    """
-    if not os.path.exists(MODEL_FILE):
-        st.warning("⚠️ Main model not found. Generating a temporary model for demonstration...")
-        
-        # Generate synthetic training data (mimicking the 2015-2023 distribution)
-        np.random.seed(42)
-        n_samples = 1000
-        # Features: Minute (10-90), xG (0.5-5.0), Early_Lead_Factor
-        minutes = np.random.randint(10, 90, n_samples)
-        xgs = np.random.uniform(0.5, 4.0, n_samples)
-        early_lead = (90 - minutes) * xgs
-        
-        X = pd.DataFrame({
-            'minute_2_0': minutes,
-            'xg_at_event': xgs,
-            'early_lead_factor': early_lead
-        })
-        
-        # Synthetic Target: Earlier leads + high xG diff = Less likely to comeback
-        prob = 0.05 + (early_lead * 0.0005) # Dummy logic
-        prob = np.clip(prob, 0.0, 1.0)
-        y = (np.random.random(n_samples) < prob).astype(int)
-        
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        clf = SVC(probability=True, class_weight='balanced', kernel='rbf', random_state=42)
-        clf.fit(X_scaled, y)
-        
-        joblib.dump(clf, MODEL_FILE)
-        joblib.dump(scaler, SCALER_FILE)
-        st.success("Temporary model created. Replace with real data later.")
+    if not os.path.exists(model_file) or not os.path.exists(scaler_file):
+        raise FileNotFoundError(f"⚠️ Files for {league_name} not found! Upload '{model_file}' and '{scaler_file}'.")
 
-def load_system():
-    ensure_model_exists()
-    model = joblib.load(MODEL_FILE)
-    scaler = joblib.load(SCALER_FILE)
+    model = joblib.load(model_file)
+    scaler = joblib.load(scaler_file)
     return model, scaler
-
-# ==========================================
-# 2. CALCULATION ENGINES
-# ==========================================
 
 def calculate_probability(minute, home_xg, away_xg, model, scaler):
     total_xg = home_xg + away_xg
     early_lead_factor = (90 - minute) * total_xg
     
-    # Prepare input vector matching training data format
     input_data = pd.DataFrame([[minute, total_xg, early_lead_factor]], 
                               columns=['minute_2_0', 'xg_at_event', 'early_lead_factor'])
     
     input_scaled = scaler.transform(input_data)
     probs = model.predict_proba(input_scaled)
-    return probs[0][1] # Probability of Class 1 (Comeback)
+    return probs[0][1]
 
-def calculate_financials(stake, back_odds, lay_odds_current, comm):
-    """
-    Calculates the financial outcome of Cashing Out vs Letting it Ride.
-    """
-    # 1. Money already secured from Bookie (2-Up Payout)
+def calculate_financials(stake, back_odds, lay_odds_current):
     bookie_profit = stake * (back_odds - 1)
-    
-    # 2. Liability on Exchange (What we stand to lose if 2-0 team wins)
-    # Original Lay Liability = Stake * (Lay_Odds_Original - 1) 
-    # But we calculate "Exit Cost" based on CURRENT market price.
-    
-    # To exit a Lay, we must BACK the team at current odds.
-    # Cost to exit = Stake / Current_Lay_Odds (Simplified Hedge calc)
-    # Note: Exchange formulas vary slightly, this is the 'Cash Out' approximation.
-    
-    # Standard Cash Out Value on Exchange (if team is winning 2-0, this is negative)
-    # If we exit now, we pay a small amount to close the bet because odds represent they are likely to win.
-    cost_to_exit = stake * (lay_odds_current - 1) # Assuming we matched stake
-    
-    # OPTION A: CASH OUT NOW
-    # We keep Bookie Profit, but we pay the exchange to close the position.
-    # Since odds are low (e.g. 1.05), cost is low.
+    cost_to_exit = stake * (lay_odds_current - 1) 
     guaranteed_profit = bookie_profit - cost_to_exit
-    
-    # OPTION B: LET IT RIDE (Full Turnaround)
-    # If comeback happens: We keep Bookie Profit AND we win the Exchange Liability.
-    # (Technically we don't pay out the liability).
-    potential_upside = bookie_profit + stake # We win the stake back on exchange
-    
+    potential_upside = bookie_profit + stake 
     return guaranteed_profit, potential_upside
 
 # ==========================================
-# 3. STREAMLIT UI LAYOUT
+# 2. SCOUTING LOGIC (The New Feature)
 # ==========================================
 
-st.set_page_config(page_title="2-Up Master Suite", layout="centered")
+@st.cache_data(ttl=3600) # Cache data for 1 hour to prevent constant re-scraping
+def get_scouting_report():
+    base_url = "https://understat.com/league"
+    all_teams = []
+    
+    progress_text = "Scanning Europe's Top Leagues..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    for i, league in enumerate(LEAGUES):
+        url = f"{base_url}/{league}/{CURRENT_SEASON_YEAR}"
+        try:
+            res = requests.get(url)
+            soup = BeautifulSoup(res.content, 'html.parser')
+            scripts = soup.find_all('script')
+            
+            teams_data = None
+            for script in scripts:
+                if 'teamsData' in script.text:
+                    start = script.text.index("('") + 2
+                    end = script.text.index("')")
+                    json_str = script.text[start:end].encode('utf8').decode('unicode_escape')
+                    teams_data = json.loads(json_str)
+                    break
+            
+            if teams_data:
+                for team_id, stats in teams_data.items():
+                    matches = int(stats['history'][0]['played'])
+                    if matches < 5: continue 
+                    
+                    xG = sum(h['xG'] for h in stats['history'])
+                    xGA = sum(h['xGA'] for h in stats['history'])
+                    
+                    xG_p90 = xG / matches
+                    xGA_p90 = xGA / matches
+                    
+                    # Chaos Score Formula
+                    chaos_score = (xG_p90 * 1.5) + (xGA_p90 * 1.0)
+                    
+                    all_teams.append({
+                        'League': league,
+                        'Team': stats['title'],
+                        'xG_For': round(xG_p90, 2),
+                        'xG_Against': round(xGA_p90, 2),
+                        'Chaos_Score': round(chaos_score, 2)
+                    })
+        except Exception as e:
+            st.error(f"Error scraping {league}: {e}")
+            
+        # Update Progress Bar
+        my_bar.progress((i + 1) / len(LEAGUES), text=f"Finished analyzing {league}...")
+            
+    my_bar.empty()
+    return pd.DataFrame(all_teams)
 
-st.title("⚽ Premier League 2-Up Predictor")
-st.markdown("### Hybrid Strategy: AI Prediction + Exit Calculator")
+# ==========================================
+# 3. UI LAYOUT
+# ==========================================
 
-# Load Model
-try:
-    model, scaler = load_system()
-except Exception as e:
-    st.error(f"System Error: {e}")
-    st.stop()
+st.title("⚽ 2-Up Master Suite")
 
-# --- INPUT SECTION ---
-with st.container():
-    st.markdown("#### 1. Match Situation (Live Data)")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        minute = st.number_input("Goal Minute", min_value=0, max_value=95, value=35)
-    with col2:
-        h_xg = st.number_input("Home xG", min_value=0.0, value=1.2, step=0.1)
-    with col3:
-        a_xg = st.number_input("Away xG", min_value=0.0, value=0.5, step=0.1)
+# Create Tabs
+tab1, tab2 = st.tabs(["⚡ Live Predictor", "🔎 Weekend Scout"])
 
-    st.markdown("#### 2. Your Position (Betting Slip)")
-    col4, col5, col6 = st.columns(3)
+# --- TAB 1: LIVE PREDICTOR ---
+with tab1:
+    st.markdown("### Decision Tool (In-Play)")
     
-    with col4:
-        stake = st.number_input("Back Stake (£)", value=50.0)
-    with col5:
-        back_odds = st.number_input("Bookie Odds", value=2.50)
-    with col6:
-        # Crucial: The odds available NOW to BACK the leader (to close lay)
-        current_odds = st.number_input("Current Live Odds", value=1.10, help="The current price to Back the leading team on the Exchange")
+    selected_league = st.selectbox("Select League", LEAGUES, key="league_select")
 
-# --- ANALYSIS SECTION ---
-if st.button("Analyze & Calculate Strategy", type="primary"):
-    
-    # A. AI Prediction
-    prob = calculate_probability(minute, h_xg, a_xg, model, scaler)
-    
-    # B. Financials
-    cash_out_profit, max_upside = calculate_financials(stake, back_odds, current_odds, 0.02)
-    
-    st.divider()
-    
-    # --- VISUALIZING THE DECISION ---
-    
-    # Thresholds
-    THRESHOLD_BET = 0.05
-    
-    st.subheader("🤖 AI Verdict")
-    
-    metric_col1, metric_col2 = st.columns(2)
-    metric_col1.metric("Comeback Probability", f"{prob:.1%}", delta_color="inverse")
-    
-    if prob >= THRESHOLD_BET:
-        decision_color = "green"
-        decision_text = "LET IT RIDE (Don't Cash Out)"
-        reason = "The AI detects statistical fragility in this lead. The risk/reward favors holding."
-    else:
-        decision_color = "red"
-        decision_text = "CASH OUT NOW (Take Profit)"
-        reason = "The lead is statistically secure. Secure your profit immediately."
+    # Load Model
+    try:
+        model, scaler = load_system(selected_league)
+    except Exception as e:
+        st.error(f"{e}")
+        st.stop()
+
+    with st.container():
+        col1, col2, col3 = st.columns(3)
+        with col1: minute = st.number_input("Goal Minute", 0, 95, 35)
+        with col2: h_xg = st.number_input("Home xG", 0.0, 10.0, 1.2, 0.1)
+        with col3: a_xg = st.number_input("Away xG", 0.0, 10.0, 0.5, 0.1)
+
+        col4, col5, col6 = st.columns(3)
+        with col4: stake = st.number_input("Back Stake (£)", value=50.0)
+        with col5: back_odds = st.number_input("Bookie Odds", value=2.50)
+        with col6: current_odds = st.number_input("Current Exchange Odds", value=1.10)
+
+    if st.button("Analyze Match", type="primary"):
+        prob = calculate_probability(minute, h_xg, a_xg, model, scaler)
+        cash_out_profit, max_upside = calculate_financials(stake, back_odds, current_odds)
         
-    st.markdown(f":{decision_color}[**DECISION: {decision_text}**]")
-    st.info(reason)
-
-    # --- FINANCIAL BREAKDOWN ---
-    st.subheader("💰 Financial Options")
-    
-    fin_col1, fin_col2 = st.columns(2)
-    
-    with fin_col1:
-        st.markdown("##### Option A: Safe Exit")
-        st.markdown(f"**Profit Now:** £{cash_out_profit:.2f}")
-        st.caption("You close the trade on the exchange immediately.")
-        if prob < THRESHOLD_BET:
-             st.success("Recommended Option")
-
-    with fin_col2:
-        st.markdown("##### Option B: Full Turnaround")
-        st.markdown(f"**Potential Profit:** £{max_upside:.2f}")
-        st.caption("You wait for a Draw or Loss. If Leader wins, you get £0 extra.")
+        st.divider()
+        
+        # AI Verdict
+        THRESHOLD_BET = 0.05
+        metric_col1, metric_col2 = st.columns(2)
+        metric_col1.metric("Comeback Probability", f"{prob:.1%}")
+        
         if prob >= THRESHOLD_BET:
-             st.success("Recommended Option")
+            st.success("✅ DECISION: LET IT RIDE (Risk/Reward Favorable)")
+            rec_color = "green"
+        else:
+            st.error("🛑 DECISION: CASH OUT NOW (Lead is Safe)")
+            rec_color = "red"
+            
+        # Financials
+        st.subheader("Financial Options")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(f"**Option A: Cash Out**")
+            st.markdown(f"**£{cash_out_profit:.2f}** profit")
+            if prob < THRESHOLD_BET: st.caption("👈 Recommended")
+        with c2:
+            st.markdown(f"**Option B: Wait**")
+            st.markdown(f"**£{max_upside:.2f}** potential")
+            if prob >= THRESHOLD_BET: st.caption("👈 Recommended")
 
-    # Visualizing Expected Value
-    ev_ride = (prob * max_upside) + ((1-prob) * 0) # Simplified EV of waiting
+# --- TAB 2: WEEKEND SCOUT ---
+with tab2:
+    st.markdown("### Volatility Scanner")
+    st.info("Use this on Fridays to find the best teams to bet on. Look for high Chaos Scores with Odds > 2.0.")
     
-    st.write("---")
-    st.markdown("#### Mathematical Expected Value (EV)")
-    st.bar_chart(pd.DataFrame({
-        'Strategy Value': [cash_out_profit, ev_ride]
-    }, index=['Cash Out Now', 'Expected Value of Waiting']))
+    if st.button("🔄 Scan Top 5 Leagues"):
+        df_scout = get_scouting_report()
+        
+        # Sort and Filter
+        df_scout = df_scout.sort_values(by='Chaos_Score', ascending=False)
+        df_scout = df_scout[df_scout['xG_For'] > 1.2] # Filter out boring teams
+        
+        st.success("Scan Complete! Here are the 'Glass Cannon' teams.")
+        
+        # Display as a clean interactive table
+        st.dataframe(
+            df_scout,
+            column_config={
+                "Chaos_Score": st.column_config.ProgressColumn(
+                    "Volatility Rating",
+                    help="Higher score = More likely to score AND concede",
+                    format="%.2f",
+                    min_value=0,
+                    max_value=5,
+                ),
+                "xG_For": st.column_config.NumberColumn("xG Scored", format="%.2f"),
+                "xG_Against": st.column_config.NumberColumn("xG Conceded", format="%.2f"),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        st.markdown("#### 💡 Strategy")
+        st.markdown("""
+        1.  Pick teams from the top of this list (High Volatility).
+        2.  Check Oddschecker: **Are their odds between 2.0 and 3.0?**
+        3.  If **YES**: This is a prime 2-Up Candidate.
+        4.  If **NO** (Odds < 1.4): Skip. No value in the trade.
+        """)
