@@ -57,8 +57,7 @@ def calculate_financials(stake, back_odds, lay_odds_current):
 # ==========================================
 # 2. SCOUTING LOGIC (The New Feature)
 # ==========================================
-
-@st.cache_data(ttl=3600) # Cache data for 1 hour to prevent constant re-scraping
+@st.cache_data(ttl=3600)
 def get_scouting_report():
     base_url = "https://understat.com/league"
     all_teams = []
@@ -73,40 +72,61 @@ def get_scouting_report():
             soup = BeautifulSoup(res.content, 'html.parser')
             scripts = soup.find_all('script')
             
-            teams_data = None
+            dates_data = None
             for script in scripts:
-                if 'teamsData' in script.text:
+                if 'datesData' in script.text:
                     start = script.text.index("('") + 2
                     end = script.text.index("')")
                     json_str = script.text[start:end].encode('utf8').decode('unicode_escape')
-                    teams_data = json.loads(json_str)
+                    dates_data = json.loads(json_str)
                     break
             
-            if teams_data:
-                for team_id, stats in teams_data.items():
-                    matches = int(stats['history'][0]['played'])
-                    if matches < 5: continue 
+            if dates_data:
+                # Manual Aggregation (More Robust than teamsData)
+                team_stats = {}
+                
+                for match in dates_data:
+                    if match.get('isResult') == True:
+                        h_team = match['h']['title']
+                        a_team = match['a']['title']
+                        h_xg = float(match['xG']['h'])
+                        a_xg = float(match['xG']['a'])
+                        
+                        # Initialize if new
+                        if h_team not in team_stats: team_stats[h_team] = {'xG': 0, 'xGA': 0, 'played': 0}
+                        if a_team not in team_stats: team_stats[a_team] = {'xG': 0, 'xGA': 0, 'played': 0}
+                        
+                        # Add Stats (Home)
+                        team_stats[h_team]['xG'] += h_xg
+                        team_stats[h_team]['xGA'] += a_xg
+                        team_stats[h_team]['played'] += 1
+                        
+                        # Add Stats (Away)
+                        team_stats[a_team]['xG'] += a_xg
+                        team_stats[a_team]['xGA'] += h_xg
+                        team_stats[a_team]['played'] += 1
+                
+                # Convert to List
+                for team_name, stats in team_stats.items():
+                    if stats['played'] < 5: continue # Skip if barely played
                     
-                    xG = sum(h['xG'] for h in stats['history'])
-                    xGA = sum(h['xGA'] for h in stats['history'])
+                    xG_p90 = stats['xG'] / stats['played']
+                    xGA_p90 = stats['xGA'] / stats['played']
                     
-                    xG_p90 = xG / matches
-                    xGA_p90 = xGA / matches
-                    
-                    # Chaos Score Formula
                     chaos_score = (xG_p90 * 1.5) + (xGA_p90 * 1.0)
                     
                     all_teams.append({
                         'League': league,
-                        'Team': stats['title'],
+                        'Team': team_name,
                         'xG_For': round(xG_p90, 2),
                         'xG_Against': round(xGA_p90, 2),
                         'Chaos_Score': round(chaos_score, 2)
                     })
+                    
         except Exception as e:
-            st.error(f"Error scraping {league}: {e}")
+            # Just log error but don't crash app
+            print(f"Error scraping {league}: {e}")
             
-        # Update Progress Bar
         my_bar.progress((i + 1) / len(LEAGUES), text=f"Finished analyzing {league}...")
             
     my_bar.empty()
@@ -176,6 +196,7 @@ with tab1:
             if prob >= THRESHOLD_BET: st.caption("👈 Recommended")
 
 # --- TAB 2: WEEKEND SCOUT ---
+# --- TAB 2: WEEKEND SCOUT ---
 with tab2:
     st.markdown("### Volatility Scanner")
     st.info("Use this on Fridays to find the best teams to bet on. Look for high Chaos Scores with Odds > 2.0.")
@@ -183,34 +204,36 @@ with tab2:
     if st.button("🔄 Scan Top 5 Leagues"):
         df_scout = get_scouting_report()
         
-        # Sort and Filter
-        df_scout = df_scout.sort_values(by='Chaos_Score', ascending=False)
-        df_scout = df_scout[df_scout['xG_For'] > 1.2] # Filter out boring teams
-        
-        st.success("Scan Complete! Here are the 'Glass Cannon' teams.")
-        
-        # Display as a clean interactive table
-        st.dataframe(
-            df_scout,
-            column_config={
-                "Chaos_Score": st.column_config.ProgressColumn(
-                    "Volatility Rating",
-                    help="Higher score = More likely to score AND concede",
-                    format="%.2f",
-                    min_value=0,
-                    max_value=5,
-                ),
-                "xG_For": st.column_config.NumberColumn("xG Scored", format="%.2f"),
-                "xG_Against": st.column_config.NumberColumn("xG Conceded", format="%.2f"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-        
-        st.markdown("#### 💡 Strategy")
-        st.markdown("""
-        1.  Pick teams from the top of this list (High Volatility).
-        2.  Check Oddschecker: **Are their odds between 2.0 and 3.0?**
-        3.  If **YES**: This is a prime 2-Up Candidate.
-        4.  If **NO** (Odds < 1.4): Skip. No value in the trade.
-        """)
+        if not df_scout.empty and 'Chaos_Score' in df_scout.columns:
+            # Sort and Filter
+            df_scout = df_scout.sort_values(by='Chaos_Score', ascending=False)
+            df_scout = df_scout[df_scout['xG_For'] > 1.2] 
+            
+            st.success("Scan Complete! Here are the 'Glass Cannon' teams.")
+            
+            st.dataframe(
+                df_scout,
+                column_config={
+                    "Chaos_Score": st.column_config.ProgressColumn(
+                        "Volatility Rating",
+                        help="Higher score = More likely to score AND concede",
+                        format="%.2f",
+                        min_value=0,
+                        max_value=5,
+                    ),
+                    "xG_For": st.column_config.NumberColumn("xG Scored", format="%.2f"),
+                    "xG_Against": st.column_config.NumberColumn("xG Conceded", format="%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.markdown("#### 💡 Strategy")
+            st.markdown("""
+            1.  Pick teams from the top of this list (High Volatility).
+            2.  Check Oddschecker: **Are their odds between 2.0 and 3.0?**
+            3.  If **YES**: This is a prime 2-Up Candidate.
+            4.  If **NO** (Odds < 1.4): Skip. No value in the trade.
+            """)
+        else:
+            st.warning("⚠️ No data found. The season might be on break, or Understat is unreachable.")
