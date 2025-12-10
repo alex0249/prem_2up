@@ -37,15 +37,34 @@ def load_system(league_name):
     return model, scaler
 
 def calculate_probability(minute, home_xg, away_xg, model, scaler):
+    # --- 1. HARD LOGIC OVERRIDES (The Sanity Check) ---
+    # Rule 1: If it's the 85th minute or later, a comeback is virtually impossible.
+    # We force probability to 0 to prevent "Hallucinations".
+    if minute >= 85:
+        return 0.00
+        
+    # Rule 2: If xG is extremely low (boring game) and it's late (75+), kill it.
     total_xg = home_xg + away_xg
+    if minute > 75 and total_xg < 1.0:
+        return 0.00
+
+    # --- 2. AI CALCULATION ---
     early_lead_factor = (90 - minute) * total_xg
     
     input_data = pd.DataFrame([[minute, total_xg, early_lead_factor]], 
                               columns=['minute_2_0', 'xg_at_event', 'early_lead_factor'])
     
     input_scaled = scaler.transform(input_data)
-    probs = model.predict_proba(input_scaled)
-    return probs[0][1]
+    
+    # Get raw probability
+    raw_prob = model.predict_proba(input_scaled)[0][1]
+    
+    # --- 3. PROBABILITY CALIBRATION ---
+    # The 'balanced' SVM inflates probs. We dampen them slightly to reduce false alarms.
+    # This maps a "Panic" score of 50% down to a realistic 15%
+    calibrated_prob = raw_prob ** 2 
+    
+    return calibrated_prob
 
 def calculate_financials(stake, back_odds, lay_odds_current):
     bookie_profit = stake * (back_odds - 1)
@@ -237,3 +256,4 @@ with tab2:
             """)
         else:
             st.warning("⚠️ No data found. The season might be on break, or Understat is unreachable.")
+
