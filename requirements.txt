@@ -3,4 +3,3 @@ pandas
 requests
 joblib
 fuzzywuzzy
-sklearn
