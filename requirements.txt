@@ -1,5 +1,9 @@
 streamlit
 pandas
-requests
+numpy
+scikit-learn
 joblib
+requests
+beautifulsoup4
 fuzzywuzzy
+python-Levenshtein
