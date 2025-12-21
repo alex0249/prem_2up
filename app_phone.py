@@ -7,8 +7,8 @@ import joblib
 import os
 import warnings
 import tempfile
-import datetime  # <--- Added this missing import
-import time      # <--- Added for safety in loops
+import datetime
+import time
 import betfairlightweight
 from betfairlightweight import filters
 from sklearn.linear_model import Ridge
@@ -22,8 +22,6 @@ warnings.filterwarnings('ignore')
 # ==========================================
 
 # 1. API KEYS (FOOTBALL DATA)
-# ---------------------------
-# Replace with your specific football-data.org key
 FD_API_KEY = 'c46720c50cc04c499506a757b9a00259' 
 BASE_URL_API = 'https://api.football-data.org/v4/matches'
 LEAGUE_CODES_API = ['PL', 'PD', 'BL1', 'SA', 'FL1']
@@ -34,34 +32,40 @@ BASE_URL_DATA = "https://www.football-data.co.uk/mmz4281"
 LEAGUE_MAP = {'E0': 'PL', 'SP1': 'PD', 'D1': 'BL1', 'I1': 'SA', 'F1': 'FL1'}
 
 # ==========================================
-# 🔐 BETFAIR AUTHENTICATION HELPER
+# 🔐 BETFAIR AUTHENTICATION HELPER (FIXED)
 # ==========================================
 
 def get_betfair_client():
     """
-    Reconstructs certificates from Streamlit Secrets and logs in to Betfair.
+    Reconstructs certificates from Streamlit Secrets into a temp directory
+    and logs in to Betfair.
     """
     if 'betfair' not in st.secrets:
-        # Fail silently or warn, but don't crash if user hasn't set up secrets yet
         return None
 
     secrets = st.secrets["betfair"]
     
-    # Create temporary files for the certificates
-    cert_file = tempfile.NamedTemporaryFile(delete=False, mode='w+')
-    cert_file.write(secrets["cert_file"])
-    cert_file.close()
+    # 1. Create a temporary directory
+    # betfairlightweight requires a folder path, not individual file paths.
+    temp_dir = tempfile.mkdtemp()
     
-    key_file = tempfile.NamedTemporaryFile(delete=False, mode='w+')
-    key_file.write(secrets["key_file"])
-    key_file.close()
+    # 2. Write the certificate files with the EXACT names required by the library
+    crt_path = os.path.join(temp_dir, "client-2048.crt")
+    key_path = os.path.join(temp_dir, "client-2048.key")
+    
+    with open(crt_path, "w") as f:
+        f.write(secrets["cert_file"])
+        
+    with open(key_path, "w") as f:
+        f.write(secrets["key_file"])
 
     try:
+        # 3. Pass the DIRECTORY (temp_dir) to the client
         trading = betfairlightweight.APIClient(
             username=secrets["username"],
             password=secrets["password"],
             app_key=secrets["app_key"],
-            certs=(cert_file.name, key_file.name),
+            certs=temp_dir,
             locale='en'
         )
         trading.login()
@@ -101,7 +105,6 @@ def get_latest_stats_and_model():
     df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
     df = df.sort_values('Date')
     
-    # Rolling Stats
     home_stats = df[['Date', 'HomeTeam', 'League_ID', 'FTHG', 'FTAG', 'HST', 'HC']].rename(
         columns={'HomeTeam': 'Team', 'FTHG': 'GF', 'FTAG': 'GA', 'HST': 'SOT', 'HC': 'Corn'}
     )
@@ -118,7 +121,6 @@ def get_latest_stats_and_model():
     
     latest_stats = team_df.groupby('Team').last().reset_index()
     
-    # Training Set
     train_df = df.merge(team_df[['Date', 'Team', 'avg_GF', 'avg_GA', 'avg_SOT', 'avg_Corn']], 
                       left_on=['Date', 'HomeTeam'], right_on=['Date', 'Team'], how='inner')
     train_df = train_df.rename(columns={'avg_GF': 'H_Att', 'avg_GA': 'H_Def', 'avg_SOT': 'H_SOT', 'avg_Corn': 'H_Corn'}).drop(columns=['Team'])
@@ -187,19 +189,18 @@ def fetch_betfair_odds(client, home_team, away_team):
     """
     if not client: return None, None
     
-    # 1. Search for the event
     search_query = f"{home_team} {away_team}"
     
     event_filter = filters.market_filter(
         text_query=search_query,
-        event_type_ids=['1'], # Football
+        event_type_ids=['1'],
         market_type_codes=['MATCH_ODDS']
     )
     
     try:
         markets = client.betting.list_market_catalogue(
             filter=event_filter,
-            max_results=1, # Just get the best match
+            max_results=1,
             market_projection=['RUNNER_METADATA', 'MARKET_START_TIME']
         )
     except: return None, None
@@ -209,11 +210,9 @@ def fetch_betfair_odds(client, home_team, away_team):
     market = markets[0]
     market_id = market.market_id
     
-    # Map runners
     selection_map = {} 
     for runner in market.runners:
         r_name = runner.runner_name
-        # Simple Logic: If fuzzy match Home > Away, it's Home
         s_home = process.extractOne(r_name, [home_team])[1]
         s_away = process.extractOne(r_name, [away_team])[1]
         
@@ -222,7 +221,6 @@ def fetch_betfair_odds(client, home_team, away_team):
         elif s_away > s_home and s_away > 60:
             selection_map[runner.selection_id] = 'Away'
 
-    # 2. Get Prices
     price_filter = filters.price_projection(price_data=['EX_BEST_OFFERS'])
     
     try:
@@ -258,19 +256,16 @@ def run_analysis_pipeline():
     fixtures = get_fixtures_api()
     if fixtures.empty: return None, "⚠️ No matches found via API."
 
-    # Init Betfair
     bf_client = get_betfair_client()
     if not bf_client:
         st.warning("⚠️ Could not log in to Betfair. Live EV will be missing (Check Secrets).")
 
     predictions = []
     
-    # Progress Bar Setup
     progress_bar = st.progress(0)
     total_games = len(fixtures)
     
     for i, row in fixtures.iterrows():
-        # Update progress
         progress_bar.progress((i + 1) / total_games)
         
         h_s = strict_match(row['Home'], row['League_Code'], stats)
@@ -287,14 +282,11 @@ def run_analysis_pipeline():
             
             prob_o25, prob_h_win, prob_a_win = simulate_match(xg_h, xg_a)
             
-            # Get Live Odds
             bf_home, bf_away = None, None
             if bf_client:
-                # Add small delay to be polite to API
                 time.sleep(0.2)
                 bf_home, bf_away = fetch_betfair_odds(bf_client, row['Home'], row['Away'])
 
-            # 2-Up Decision
             if prob_h_win > prob_a_win:
                 pick = row['Home']
                 prob_win = prob_h_win
@@ -304,10 +296,8 @@ def run_analysis_pipeline():
                 prob_win = prob_a_win
                 live_odds = bf_away
 
-            # EV Calculation
             ev_str = "N/A"
             if live_odds:
-                # EV Formula: (Probability * Odds) - 1
                 ev = (prob_win * live_odds) - 1
                 ev_str = f"{ev:.2f}"
                 if ev > 0: ev_str = f"✅ {ev_str}"
@@ -334,10 +324,11 @@ if st.button("🔄 Analyze Expected Value (With Betfair Odds)"):
     with st.spinner("Training models & Scanning Betfair Markets..."):
         df, msg = run_analysis_pipeline()
         if df is not None:
-            # Display Result
             st.dataframe(
                 df, 
-                use_container_width=True,
+                # FIXED: Removed 'use_container_width=True' to silence warning.
+                # If your streamlit version is extremely new, you can add width='stretch' here.
+                # But removing it is safest.
                 column_config={
                     "Fair Odds": st.column_config.NumberColumn(
                         "Fair Odds",
