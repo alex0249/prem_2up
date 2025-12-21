@@ -320,15 +320,15 @@ def run_analysis_pipeline():
 
 st.title("⚽ 2-Up Master Suite (Betfair Integrated)")
 
+# ... (rest of the script is unchanged)
+
 if st.button("🔄 Analyze Expected Value (With Betfair Odds)"):
     with st.spinner("Training models & Scanning Betfair Markets..."):
         df, msg = run_analysis_pipeline()
         if df is not None:
             st.dataframe(
                 df, 
-                # FIXED: Removed 'use_container_width=True' to silence warning.
-                # If your streamlit version is extremely new, you can add width='stretch' here.
-                # But removing it is safest.
+                width=None, # Replaces use_container_width=True to fix the warning
                 column_config={
                     "Fair Odds": st.column_config.NumberColumn(
                         "Fair Odds",
@@ -344,3 +344,4 @@ if st.button("🔄 Analyze Expected Value (With Betfair Odds)"):
             )
         else:
             st.warning(msg)
+
