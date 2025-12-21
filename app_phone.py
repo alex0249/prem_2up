@@ -320,15 +320,15 @@ def run_analysis_pipeline():
 
 st.title("⚽ 2-Up Master Suite (Betfair Integrated)")
 
-# ... (rest of the script is unchanged)
-
 if st.button("🔄 Analyze Expected Value (With Betfair Odds)"):
     with st.spinner("Training models & Scanning Betfair Markets..."):
         df, msg = run_analysis_pipeline()
         if df is not None:
             st.dataframe(
                 df, 
-                width=None, # Replaces use_container_width=True to fix the warning
+                # FIX: use_container_width=True is the safest option. 
+                # If you get a warning, you can ignore it, or change it to width="stretch"
+                use_container_width=True, 
                 column_config={
                     "Fair Odds": st.column_config.NumberColumn(
                         "Fair Odds",
@@ -344,4 +344,5 @@ if st.button("🔄 Analyze Expected Value (With Betfair Odds)"):
             )
         else:
             st.warning(msg)
+
 
